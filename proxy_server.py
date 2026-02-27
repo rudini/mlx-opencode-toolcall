@@ -4,17 +4,25 @@ Injects tool-calling prompts, strips tools from payload, and parses
 [TOOL_CALL] blocks from response into OpenAI tool_calls format.
 """
 import re
-import uuid
 from contextlib import asynccontextmanager
+from secrets import token_hex
 
 import orjson
 import httpx
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse, JSONResponse, Response
+from fastapi.responses import StreamingResponse, Response
 
 # Backend mlx-openai-server URL
 BACKEND_URL = "http://localhost:8000"
+
+
+class ORJSONResponse(Response):
+    """JSONResponse replacement that uses orjson for ~3x faster serialization."""
+    media_type = "application/json"
+
+    def render(self, content) -> bytes:
+        return orjson.dumps(content)
 
 # Pre-compiled regex patterns (Change 3)
 RE_TOOL_CALL = re.compile(r'\[TOOL_CALL\]\s*(.*?)\s*\[/TOOL_CALL\]', re.DOTALL)
@@ -27,7 +35,11 @@ RE_BARE_JSON = re.compile(r'\{[^{}]*"name"\s*:\s*"(\w+)"[^{}]*"arguments"\s*:', 
 # Global connection-pooled httpx client (Change 1)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.client = httpx.AsyncClient(base_url=BACKEND_URL, timeout=300)
+    app.state.client = httpx.AsyncClient(
+        base_url=BACKEND_URL,
+        timeout=300,
+        limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+    )
     yield
     await app.state.client.aclose()
 
@@ -85,7 +97,7 @@ def parse_tool_calls(text: str) -> tuple[str | None, list | None]:
             arguments = parsed.get("arguments", {})
             tool_calls.append({
                 "index": idx,
-                "id": f"call_{uuid.uuid4().hex[:24]}",
+                "id": f"call_{token_hex(12)}",
                 "type": "function",
                 "function": {
                     "name": name,
@@ -210,7 +222,7 @@ def rewrite_response(data: dict, tool_names: list, tool_schemas: dict = None) ->
                                     arguments = parsed.get("arguments", {})
                                     tool_calls = [{
                                         "index": 0,
-                                        "id": f"call_{uuid.uuid4().hex[:24]}",
+                                        "id": f"call_{token_hex(12)}",
                                         "type": "function",
                                         "function": {
                                             "name": name,
@@ -270,7 +282,7 @@ def rewrite_response(data: dict, tool_names: list, tool_schemas: dict = None) ->
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    payload = await request.json()
+    payload = orjson.loads(await request.body())
     has_tools = bool(payload.get("tools"))
     is_stream = payload.get("stream", False)
 
@@ -289,10 +301,11 @@ async def chat_completions(request: Request):
     # Rewrite request to inject tool prompts and strip tools
     payload, tool_names, tool_schemas = rewrite_request(payload)
 
-    # For tool-call requests, force non-streaming and cap tokens
+    # For tool-call requests, force non-streaming, cap tokens, and use temp=0 for deterministic output
     if has_tools:
         payload["stream"] = False
         payload["max_tokens"] = min(payload.get("max_tokens", 4096), 4096)
+        payload["temperature"] = 0
 
     client = request.app.state.client  # Change 1: reuse pooled client
 
@@ -303,7 +316,6 @@ async def chat_completions(request: Request):
                 "POST",
                 "/v1/chat/completions",
                 json=payload,
-                headers={"Content-Type": "application/json"},
             ) as resp:
                 async for chunk in resp.aiter_bytes():
                     yield chunk
@@ -321,14 +333,13 @@ async def chat_completions(request: Request):
         resp = await client.post(
             "/v1/chat/completions",
             json=payload,
-            headers={"Content-Type": "application/json"},
         )
 
         if resp.status_code != 200:
             print(f"[proxy] Backend error {resp.status_code}: {resp.text[:500]}")
-            return JSONResponse(content=resp.json(), status_code=resp.status_code)
+            return ORJSONResponse(content=orjson.loads(resp.content), status_code=resp.status_code)
 
-        data = resp.json()
+        data = orjson.loads(resp.content)
 
         # Strip thinking tags before any processing (uses pre-compiled regexes)
         try:
@@ -348,7 +359,7 @@ async def chat_completions(request: Request):
             def fake_stream():
                 # Change 4: Pre-build base chunk dict once, use orjson
                 base = {
-                    "id": data.get("id", f"chatcmpl_{uuid.uuid4().hex}"),
+                    "id": data.get("id", f"chatcmpl_{token_hex(16)}"),
                     "object": "chat.completion.chunk",
                     "created": data.get("created", 0),
                     "model": data.get("model", ""),
@@ -398,7 +409,7 @@ async def chat_completions(request: Request):
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
             )
 
-        return JSONResponse(content=data)
+        return ORJSONResponse(content=data)
 
 
 @app.get("/v1/models")
@@ -407,7 +418,7 @@ async def list_models(request: Request):
     print("[proxy] GET /v1/models")
     client = request.app.state.client
     resp = await client.get("/v1/models")
-    return JSONResponse(content=resp.json(), status_code=resp.status_code)
+    return ORJSONResponse(content=orjson.loads(resp.content), status_code=resp.status_code)
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
@@ -423,7 +434,7 @@ async def fallback_proxy(request: Request, path: str):
         content=body,
     )
     try:
-        return JSONResponse(content=resp.json(), status_code=resp.status_code)
+        return ORJSONResponse(content=orjson.loads(resp.content), status_code=resp.status_code)
     except Exception:
         return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
 

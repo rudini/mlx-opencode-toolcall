@@ -132,12 +132,71 @@ Without this patch you'll get HTTP 500 errors:
 ValueError: No user query found in the messages
 ```
 
+### Patch C — Performance tuning (optional but recommended)
+
+These patches improve inference speed on Apple Silicon by tuning conservative defaults. Tested on M3 Pro (36 GB).
+
+**File**: `$SITE_PACKAGES/app/models/mlx_lm.py`
+
+Find the `generate()` and `stream_generate()` calls (around line 173-188) and add `kv_bits=8` and `prefill_step_size=512`:
+
+```python
+# Non-streaming
+return generate(
+    self.model,
+    self.tokenizer,
+    prompt,
+    sampler=sampler,
+    max_tokens=max_tokens,
+    kv_bits=8,
+    prefill_step_size=512
+)
+
+# Streaming
+return stream_generate(
+    self.model,
+    self.tokenizer,
+    prompt,
+    sampler=sampler,
+    max_tokens=max_tokens,
+    kv_bits=8,
+    prefill_step_size=512
+)
+```
+
+- **`kv_bits=8`**: Quantizes the KV cache from full precision to 8-bit. Halves KV cache memory, allows more tokens in cache, and speeds up attention computation (~15-25% faster decoding for long contexts).
+- **`prefill_step_size=512`**: Reduces prefill chunk size from the default 2048. With a 35B model, smaller chunks avoid memory spikes during prompt processing and are faster for typical prompt sizes (<1K tokens).
+
+**File**: `$SITE_PACKAGES/app/main.py` (line ~140)
+
+Change the GC interval from 50 to 200 requests:
+
+```python
+# Before:
+if request.app.state.request_count % 50 == 0:
+# After:
+if request.app.state.request_count % 200 == 0:
+```
+
+**File**: `$SITE_PACKAGES/app/core/queue.py` (line ~171)
+
+Change the GC interval from 10 to 50 completed requests:
+
+```python
+# Before:
+if len(self.active_requests) % 10 == 0:  # Every 10 requests
+# After:
+if len(self.active_requests) % 50 == 0:  # Every 50 requests
+```
+
+These GC changes reduce latency spikes from `gc.collect()` + `mx.clear_cache()` during active use. Safe on machines with 32 GB+ RAM.
+
 ## Step 4 — The proxy server
 
 The proxy (`proxy_server.py`) sits between OpenCode and the MLX backend. See the architecture diagram above for how data flows.
 
 Key behaviors:
-- **Tool requests**: Forces non-streaming mode, caps `max_tokens` at 4096 for tool calls
+- **Tool requests**: Forces non-streaming mode, caps `max_tokens` at 4096, and sets `temperature=0` for deterministic tool calls (argmax sampling, no sampling overhead)
 - **Streaming passthrough**: Non-tool requests stream SSE directly from the backend
 - **History rewriting**: Converts OpenAI `tool_calls` / `tool` role messages in chat history back into plain text the backend can understand
 - **Fallback parsing**: If the model emits a bare JSON tool call without `[TOOL_CALL]` brackets, the proxy still detects and parses it
@@ -200,9 +259,9 @@ MLX_VENV=~/my-other-venv ./start.sh
 
 ```bash
 source ~/mlx-env/bin/activate
-python -m mlx_vlm.server \
-  --model mlx-community/Qwen3.5-35B-A3B-4bit \
-  --host 0.0.0.0 \
+mlx-openai-server launch \
+  --model-path mlx-community/Qwen3.5-35B-A3B-4bit \
+  --model-type multimodal \
   --port 8000
 ```
 
