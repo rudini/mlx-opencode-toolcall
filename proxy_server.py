@@ -7,6 +7,7 @@ import re
 from contextlib import asynccontextmanager
 from secrets import token_hex
 
+import time
 import orjson
 import httpx
 import uvicorn
@@ -24,9 +25,9 @@ class ORJSONResponse(Response):
     def render(self, content) -> bytes:
         return orjson.dumps(content)
 
-# Pre-compiled regex patterns (Change 3)
-RE_TOOL_CALL = re.compile(r'\[TOOL_CALL\]\s*(.*?)\s*\[/TOOL_CALL\]', re.DOTALL)
-RE_TOOL_CALL_STRIP = re.compile(r'\[TOOL_CALL\]\s*.*?\s*\[/TOOL_CALL\]', re.DOTALL)
+# Pre-compiled regex patterns — match [TOOL_CALL], TOOL_CALL, <tool_call> variants
+RE_TOOL_CALL = re.compile(r'(?:\[TOOL_CALL\]|TOOL_CALL|<tool_call>)\s*(.*?)\s*(?:\[/TOOL_CALL\]|/TOOL_CALL|</tool_call>)', re.DOTALL)
+RE_TOOL_CALL_STRIP = re.compile(r'(?:\[TOOL_CALL\]|TOOL_CALL|<tool_call>)\s*.*?\s*(?:\[/TOOL_CALL\]|/TOOL_CALL|</tool_call>)', re.DOTALL)
 RE_THINK_BLOCK = re.compile(r'<think>.*?</think>', re.DOTALL)
 RE_THINK_CLOSE = re.compile(r'</think>')
 RE_BARE_JSON = re.compile(r'\{[^{}]*"name"\s*:\s*"(\w+)"[^{}]*"arguments"\s*:', re.DOTALL)
@@ -72,9 +73,11 @@ def build_tool_system_prompt(tools: list) -> str:
     tools_block = "\n\n".join(tool_descriptions)
 
     return (
-        "/no_think\nYou are a helpful AI coding assistant. Be concise. No reasoning. No thinking.\n\n"
-        "TOOL FORMAT: wrap calls in [TOOL_CALL] and [/TOOL_CALL] brackets. Include ALL required params.\n"
-        '[TOOL_CALL]\n{"name": "bash", "arguments": {"command": "ls -la", "description": "List files"}}\n[/TOOL_CALL]\n\n'
+        "Concise coding assistant. Background servers/watchers with &. Use 'open' to launch URLs/files.\n\n"
+        "[TOOL_CALL]\n"
+        '{"name": "NAME", "arguments": {"param": "value"}}\n'
+        "[/TOOL_CALL]\n"
+        "Include ALL required params. Keep [TOOL_CALL] wrappers.\n\n"
         f"TOOLS:\n{tools_block}"
     )
 
@@ -286,28 +289,147 @@ async def chat_completions(request: Request):
     has_tools = bool(payload.get("tools"))
     is_stream = payload.get("stream", False)
 
+    t_start = time.perf_counter()
     print(f"[proxy] POST /v1/chat/completions stream={is_stream} tools={has_tools} model={payload.get('model')}")
 
-    # Inject /no_think to disable reasoning for all requests
-    messages = payload.get("messages", [])
-    if messages and messages[0].get("role") == "system":
-        content = messages[0].get("content", "")
-        if isinstance(content, str) and "/no_think" not in content:
-            messages[0]["content"] = "/no_think\n" + content
-    elif messages:
-        messages.insert(0, {"role": "system", "content": "/no_think\nBe concise."})
-    payload["messages"] = messages
+    # No special injection needed — enable_thinking=False is set at the template level
 
     # Rewrite request to inject tool prompts and strip tools
     payload, tool_names, tool_schemas = rewrite_request(payload)
 
-    # For tool-call requests, force non-streaming, cap tokens, and use temp=0 for deterministic output
+    # For tool-call requests, stream from backend and stop early at [/TOOL_CALL]
     if has_tools:
-        payload["stream"] = False
-        payload["max_tokens"] = min(payload.get("max_tokens", 4096), 4096)
+        payload["stream"] = True
+        payload["max_tokens"] = 512   # larger cap; we break early anyway
         payload["temperature"] = 0
 
     client = request.app.state.client  # Change 1: reuse pooled client
+
+    if has_tools:
+        # Stream from backend, buffer tokens, stop as soon as [/TOOL_CALL] is complete
+        buffer = ""
+        finish_reason = "stop"
+        response_id = f"chatcmpl_{token_hex(16)}"
+        response_created = 0
+        response_model = payload.get("model", "")
+
+        try:
+            async with client.stream("POST", "/v1/chat/completions", json=payload) as resp:
+                if resp.status_code != 200:
+                    body = await resp.aread()
+                    print(f"[proxy] Backend error {resp.status_code}: {body[:500]}")
+                    try:
+                        return ORJSONResponse(content=orjson.loads(body), status_code=resp.status_code)
+                    except Exception:
+                        return Response(content=body, status_code=resp.status_code)
+
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    line_data = line[6:]
+                    if line_data == "[DONE]":
+                        break
+                    try:
+                        chunk = orjson.loads(line_data)
+                        response_id = chunk.get("id", response_id)
+                        response_created = chunk.get("created", response_created)
+                        response_model = chunk.get("model", response_model)
+                        choice = chunk["choices"][0]
+                        delta = choice.get("delta", {})
+                        token = delta.get("content", "")
+                        if token:
+                            buffer += token
+                        fr = choice.get("finish_reason")
+                        if fr:
+                            finish_reason = fr
+                        # Early stop — we have the complete tool call
+                        if "[/TOOL_CALL]" in buffer or "/TOOL_CALL" in buffer:
+                            break
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"[proxy] Stream error: {e}")
+            return ORJSONResponse(content={"error": str(e)}, status_code=500)
+
+        # Reconstruct a response object for rewrite_response
+        data = {
+            "id": response_id,
+            "object": "chat.completion",
+            "created": response_created,
+            "model": response_model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": buffer},
+                "finish_reason": finish_reason,
+            }],
+        }
+
+        # Log perf
+        t_elapsed = time.perf_counter() - t_start
+        completion_tokens = max(1, len(buffer) // 4)
+        print(f"[proxy] ~{completion_tokens} tokens in {t_elapsed:.1f}s = ~{completion_tokens/t_elapsed:.1f} tok/s  (early-stop stream)")
+
+        # Strip thinking tags
+        try:
+            raw = data["choices"][0]["message"]["content"]
+            cleaned = RE_THINK_BLOCK.sub('', raw)
+            cleaned = RE_THINK_CLOSE.sub('', cleaned).strip()
+            data["choices"][0]["message"]["content"] = cleaned
+        except Exception:
+            pass
+
+        data = rewrite_response(data, tool_names, tool_schemas)
+
+        if is_stream:
+            def fake_stream():
+                base = {
+                    "id": data.get("id", f"chatcmpl_{token_hex(16)}"),
+                    "object": "chat.completion.chunk",
+                    "created": data.get("created", 0),
+                    "model": data.get("model", ""),
+                }
+                for choice in data.get("choices", []):
+                    msg = choice.get("message", {})
+                    tool_calls = msg.get("tool_calls")
+                    content = msg.get("content")
+
+                    role_delta = {"role": "assistant"}
+                    if not tool_calls:
+                        role_delta["content"] = ""
+                    chunk = {**base, "choices": [{"index": 0, "delta": role_delta, "finish_reason": None}]}
+                    yield f"data: {orjson.dumps(chunk).decode()}\n\n"
+
+                    if content:
+                        chunk["choices"] = [{"index": 0, "delta": {"content": content}, "finish_reason": None}]
+                        yield f"data: {orjson.dumps(chunk).decode()}\n\n"
+
+                    if tool_calls:
+                        for tc in tool_calls:
+                            tc_delta = {
+                                "index": tc.get("index", 0),
+                                "id": tc["id"],
+                                "type": "function",
+                                "function": {
+                                    "name": tc["function"]["name"],
+                                    "arguments": tc["function"]["arguments"],
+                                }
+                            }
+                            chunk["choices"] = [{"index": 0, "delta": {"tool_calls": [tc_delta]}, "finish_reason": None}]
+                            yield f"data: {orjson.dumps(chunk).decode()}\n\n"
+
+                    finish = choice.get("finish_reason", "stop")
+                    chunk["choices"] = [{"index": 0, "delta": {}, "finish_reason": finish}]
+                    yield f"data: {orjson.dumps(chunk).decode()}\n\n"
+
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(
+                fake_stream(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+            )
+
+        return ORJSONResponse(content=data)
 
     if is_stream and not has_tools:
         # Stream: proxy SSE directly from backend
@@ -329,87 +451,12 @@ async def chat_completions(request: Request):
             },
         )
     else:
-        # Non-streaming
-        resp = await client.post(
-            "/v1/chat/completions",
-            json=payload,
-        )
-
+        # Non-streaming, no tools — pass through directly
+        resp = await client.post("/v1/chat/completions", json=payload)
         if resp.status_code != 200:
             print(f"[proxy] Backend error {resp.status_code}: {resp.text[:500]}")
             return ORJSONResponse(content=orjson.loads(resp.content), status_code=resp.status_code)
-
-        data = orjson.loads(resp.content)
-
-        # Strip thinking tags before any processing (uses pre-compiled regexes)
-        try:
-            raw = data["choices"][0]["message"]["content"]
-            cleaned = RE_THINK_BLOCK.sub('', raw)
-            cleaned = RE_THINK_CLOSE.sub('', cleaned).strip()
-            data["choices"][0]["message"]["content"] = cleaned
-            print(f"[proxy] RAW MODEL OUTPUT:\n{raw[:500]}")
-        except Exception:
-            pass
-
-        if has_tools:
-            data = rewrite_response(data, tool_names, tool_schemas)
-
-        # If the original request wanted streaming, wrap our JSON response as SSE
-        if is_stream and has_tools:
-            def fake_stream():
-                # Change 4: Pre-build base chunk dict once, use orjson
-                base = {
-                    "id": data.get("id", f"chatcmpl_{token_hex(16)}"),
-                    "object": "chat.completion.chunk",
-                    "created": data.get("created", 0),
-                    "model": data.get("model", ""),
-                }
-                for choice in data.get("choices", []):
-                    msg = choice.get("message", {})
-                    tool_calls = msg.get("tool_calls")
-                    content = msg.get("content")
-
-                    # First chunk: role
-                    role_delta = {"role": "assistant"}
-                    if not tool_calls:
-                        role_delta["content"] = ""
-                    chunk = {**base, "choices": [{"index": 0, "delta": role_delta, "finish_reason": None}]}
-                    yield f"data: {orjson.dumps(chunk).decode()}\n\n"
-
-                    # Content chunk if any
-                    if content:
-                        chunk["choices"] = [{"index": 0, "delta": {"content": content}, "finish_reason": None}]
-                        yield f"data: {orjson.dumps(chunk).decode()}\n\n"
-
-                    # Tool calls: send each tool call in its own delta chunk
-                    if tool_calls:
-                        for tc in tool_calls:
-                            tc_delta = {
-                                "index": tc.get("index", 0),
-                                "id": tc["id"],
-                                "type": "function",
-                                "function": {
-                                    "name": tc["function"]["name"],
-                                    "arguments": tc["function"]["arguments"],
-                                }
-                            }
-                            chunk["choices"] = [{"index": 0, "delta": {"tool_calls": [tc_delta]}, "finish_reason": None}]
-                            yield f"data: {orjson.dumps(chunk).decode()}\n\n"
-
-                    # Final chunk with finish_reason
-                    finish = choice.get("finish_reason", "stop")
-                    chunk["choices"] = [{"index": 0, "delta": {}, "finish_reason": finish}]
-                    yield f"data: {orjson.dumps(chunk).decode()}\n\n"
-
-                yield "data: [DONE]\n\n"
-
-            return StreamingResponse(
-                fake_stream(),
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-            )
-
-        return ORJSONResponse(content=data)
+        return ORJSONResponse(content=orjson.loads(resp.content))
 
 
 @app.get("/v1/models")

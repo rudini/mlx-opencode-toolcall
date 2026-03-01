@@ -47,8 +47,9 @@ echo "Model: $MODEL"
 echo "(First run will download ~19 GB from HuggingFace)"
 echo ""
 
-python -m mlx_vlm.server \
-  --model "$MODEL" \
+mlx-openai-server launch \
+  --model-path "$MODEL" \
+  --model-type multimodal \
   --host 0.0.0.0 \
   --port "$BACKEND_PORT" &
 BACKEND_PID=$!
