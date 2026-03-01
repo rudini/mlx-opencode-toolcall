@@ -176,6 +176,25 @@ class TestParseToolCalls:
         assert remaining == text
         assert tc is None
 
+    def test_literal_newlines_in_json_strings(self):
+        # Model emits literal newlines inside JSON string values (e.g. multiline oldString)
+        old_code = "function foo() {\n    return 1;\n}"
+        new_code = "function foo() {\n    return 2;\n}"
+        # Build a [TOOL_CALL] block with real newlines inside the string values.
+        # Use concatenation (not f-string) to avoid }} → } escaping confusion.
+        raw_json = (
+            '{"name": "edit", "arguments": {"filePath": "/a/b.js",'
+            ' "oldString": "' + old_code + '", "newString": "' + new_code + '"}}'
+        )
+        # raw_json now has literal newlines inside the string values — invalid JSON
+        text = "[TOOL_CALL]\n" + raw_json + "\n[/TOOL_CALL]"
+        remaining, tc = parse_tool_calls(text)
+        assert tc is not None, "Should recover from literal newlines in JSON strings"
+        assert tc[0]["function"]["name"] == "edit"
+        args = json.loads(tc[0]["function"]["arguments"])
+        assert args["filePath"] == "/a/b.js"
+        assert "return 2" in args["newString"]
+
     def test_mixed_valid_and_invalid(self):
         text = (
             '[TOOL_CALL]\n{"name": "bash", "arguments": {"command": "ls"}}\n[/TOOL_CALL]\n'

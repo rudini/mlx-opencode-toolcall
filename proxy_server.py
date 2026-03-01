@@ -33,6 +33,41 @@ RE_THINK_CLOSE = re.compile(r'</think>')
 RE_BARE_JSON = re.compile(r'\{[^{}]*"name"\s*:\s*"(\w+)"[^{}]*"arguments"\s*:', re.DOTALL)
 
 
+def _fix_json_newlines(s: str) -> str:
+    """Escape literal newlines/tabs inside JSON string values.
+
+    The model sometimes emits multi-line code (oldString/newString) with real
+    newline characters inside JSON strings instead of the required \\n escapes.
+    This state-machine pass fixes them so orjson can parse the result.
+    """
+    result = []
+    in_string = False
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if c == '\\' and in_string:
+            # Pass backslash-escape pair through unchanged
+            result.append(c)
+            i += 1
+            if i < len(s):
+                result.append(s[i])
+            i += 1
+            continue
+        if c == '"':
+            in_string = not in_string
+            result.append(c)
+        elif in_string and c == '\n':
+            result.append('\\n')
+        elif in_string and c == '\r':
+            result.append('\\r')
+        elif in_string and c == '\t':
+            result.append('\\t')
+        else:
+            result.append(c)
+        i += 1
+    return ''.join(result)
+
+
 # Global connection-pooled httpx client (Change 1)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -94,21 +129,25 @@ def parse_tool_calls(text: str) -> tuple[str | None, list | None]:
 
     tool_calls = []
     for idx, match in enumerate(matches):
+        raw = match.strip()
         try:
-            parsed = orjson.loads(match.strip())
-            name = parsed.get("name", "unknown")
-            arguments = parsed.get("arguments", {})
-            tool_calls.append({
-                "index": idx,
-                "id": f"call_{token_hex(12)}",
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": orjson.dumps(arguments).decode() if isinstance(arguments, dict) else str(arguments)
-                }
-            })
+            parsed = orjson.loads(raw)
         except (orjson.JSONDecodeError, ValueError):
-            continue
+            try:
+                parsed = orjson.loads(_fix_json_newlines(raw))
+            except (orjson.JSONDecodeError, ValueError):
+                continue
+        name = parsed.get("name", "unknown")
+        arguments = parsed.get("arguments", {})
+        tool_calls.append({
+            "index": idx,
+            "id": f"call_{token_hex(12)}",
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": orjson.dumps(arguments).decode() if isinstance(arguments, dict) else str(arguments)
+            }
+        })
 
     if not tool_calls:
         return text, None
