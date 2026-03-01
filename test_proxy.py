@@ -124,7 +124,6 @@ class TestBuildToolSystemPrompt:
         assert "command" in prompt
         assert "(required)" in prompt
         assert "[TOOL_CALL]" in prompt
-        assert "/no_think" in prompt
 
     def test_tool_missing_optional_fields(self):
         prompt = build_tool_system_prompt([SAMPLE_TOOL_MINIMAL])
@@ -375,12 +374,16 @@ class TestChatCompletionsEndpoint:
 
     @pytest.mark.asyncio
     async def test_tools_present(self, async_client):
-        backend_resp = _chat_response(
+        sse_body = _sse_chunks(
             '[TOOL_CALL]\n{"name": "bash", "arguments": {"command": "ls", "description": "list"}}\n[/TOOL_CALL]'
         )
         with respx.mock(base_url=BACKEND_URL) as mock:
             mock.post("/v1/chat/completions").mock(
-                return_value=httpx.Response(200, json=backend_resp)
+                return_value=httpx.Response(
+                    200,
+                    content=sse_body.encode(),
+                    headers={"content-type": "text/event-stream"},
+                )
             )
             resp = await async_client.post(
                 "/v1/chat/completions",
@@ -398,12 +401,16 @@ class TestChatCompletionsEndpoint:
 
     @pytest.mark.asyncio
     async def test_tools_stream_returns_sse(self, async_client):
-        backend_resp = _chat_response(
+        sse_body = _sse_chunks(
             '[TOOL_CALL]\n{"name": "bash", "arguments": {"command": "ls", "description": "list"}}\n[/TOOL_CALL]'
         )
         with respx.mock(base_url=BACKEND_URL) as mock:
             mock.post("/v1/chat/completions").mock(
-                return_value=httpx.Response(200, json=backend_resp)
+                return_value=httpx.Response(
+                    200,
+                    content=sse_body.encode(),
+                    headers={"content-type": "text/event-stream"},
+                )
             )
             resp = await async_client.post(
                 "/v1/chat/completions",

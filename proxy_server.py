@@ -456,7 +456,15 @@ async def chat_completions(request: Request):
         if resp.status_code != 200:
             print(f"[proxy] Backend error {resp.status_code}: {resp.text[:500]}")
             return ORJSONResponse(content=orjson.loads(resp.content), status_code=resp.status_code)
-        return ORJSONResponse(content=orjson.loads(resp.content))
+        data = orjson.loads(resp.content)
+        for choice in data.get("choices", []):
+            msg = choice.get("message", {})
+            content = msg.get("content")
+            if content and isinstance(content, str):
+                content = RE_THINK_BLOCK.sub('', content).strip()
+                content = RE_THINK_CLOSE.sub('', content).strip()
+                msg["content"] = content
+        return ORJSONResponse(content=data)
 
 
 @app.get("/v1/models")
