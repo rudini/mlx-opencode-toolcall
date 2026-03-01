@@ -132,16 +132,19 @@ ValueError: No user query found in the messages
 
 These patches improve inference speed on Apple Silicon by tuning conservative defaults.
 
-**File**: `$SITE_PACKAGES/app/models/mlx_vlm.py`
+**File**: `$SITE_PACKAGES/app/models/mlx_vlm.py` — replace with the version in `mlx_vlm_model.py`
 
-In the `__call__` method, add one line after `model_params` is built (just before the `if not stream:` block):
+This file includes all performance optimizations:
 
-```python
-# 8-bit KV cache quantization: halves KV memory, reduces attention bandwidth ~15-25%
-model_params.setdefault("kv_bits", 8)
-```
+- **`kv_bits=8`**: 8-bit KV cache quantization — halves KV memory, reduces attention bandwidth 15–25% per decoding step
+- **System prompt KV cache**: Pre-fills the system prompt tokens once on first request, snapshots the KV state, and reuses it on every subsequent request. Only the new user message tokens need prefilling per request. This eliminates ~0.9s of prefill time per hot request
+  - Cold request (first use / new system prompt): ~1.8s — builds the KV cache
+  - Warm request (same system prompt): **~0.87s, 25 tok/s** — 2× speedup
 
-`kv_bits=8` quantizes the KV cache from float16 to int8. Every autoregressive decoding step reads the full KV cache from memory — halving its size directly reduces memory bandwidth and speeds up attention by 15–25%.
+Technical notes:
+- Uses `generate_step(max_tokens=0)` for prefill-only (avoids a bug in `stream_generate` where the post-loop finalize yield crashes when 0 tokens are generated)
+- Uses `cls.from_state(state, meta_state)` to restore cache — same protocol as `mlx_lm.save_prompt_cache`/`load_prompt_cache`, handles both `KVCache` and `ArraysCache` (Qwen3.5 uses 10 KVCache + 30 ArraysCache layers)
+- System prefix tokenized directly as `<|im_start|>system\n...<|im_end|>\n` — bypasses Jinja template restriction (Qwen3.5's template requires at least one user turn)
 
 **File**: `$SITE_PACKAGES/app/main.py` (line ~140) — Change GC interval from 50 to 200:
 
@@ -201,7 +204,7 @@ model_params = {
 }
 ```
 
-Without this patch, tool calls take ~16s at ~3 tok/s. With it, they complete in ~1.8s at ~15 tok/s. With all patches applied (A–D plus Patch C kv_bits), hot tool calls reach **0.6–0.9s**.
+Without this patch, tool calls take ~16s at ~3 tok/s. With it, they complete in ~1.8s at ~15 tok/s. With all patches applied (A–D plus Patch C kv_bits + KV cache reuse), warm tool calls reach **~0.87s at ~25 tok/s**.
 
 ## Step 4 — The proxy server
 
@@ -352,6 +355,7 @@ The proxy must support streaming — earlier versions blocked on non-streaming t
 mlx-opencode-toolcall/
 ├── README.md              ← This file
 ├── proxy_server.py        ← Tool-call middleware proxy
+├── mlx_vlm_model.py       ← Patched model wrapper (Patches C+D + KV cache reuse)
 ├── opencode-config.json   ← Example OpenCode configuration
 ├── start.sh               ← Script to launch the full stack
 └── test_proxy.py          ← Proxy unit tests
