@@ -83,6 +83,26 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="MLX Tool-Call Proxy", lifespan=lifespan)
 
 
+def _is_simple_schema(params: dict) -> bool:
+    """Check if a tool's parameter schema is simple enough for the model.
+
+    Rejects tools with nested objects or arrays-of-objects (e.g. question tool
+    with questions[].options[].label) since the model can't reliably format them.
+    """
+    props = params.get("properties", {})
+    for pinfo in props.values():
+        ptype = pinfo.get("type", "")
+        # Reject object-typed params (nested JSON)
+        if ptype == "object" and pinfo.get("properties"):
+            return False
+        # Reject array-of-objects params
+        if ptype == "array":
+            items = pinfo.get("items", {})
+            if items.get("type") == "object" or items.get("properties"):
+                return False
+    return True
+
+
 def build_tool_system_prompt(tools: list) -> str:
     """Build a system prompt that instructs the model to use [TOOL_CALL] format."""
     tool_descriptions = []
@@ -211,6 +231,20 @@ def rewrite_request(payload: dict) -> tuple[dict, list]:
     """Rewrite the request: inject tool prompt, strip tools/tool_choice.
     Returns (payload, original_tools)."""
     tools = payload.get("tools", []) or []
+    if not tools:
+        payload.pop("tools", None)
+        payload.pop("tool_choice", None)
+        return payload, [], {}
+
+    # Filter out tools with schemas too complex for the model
+    original_count = len(tools)
+    tools = [t for t in tools if _is_simple_schema(
+        (t.get("function", t)).get("parameters", {})
+    )]
+    if len(tools) < original_count:
+        dropped = original_count - len(tools)
+        print(f"[proxy] Dropped {dropped} tool(s) with complex schemas")
+
     if not tools:
         payload.pop("tools", None)
         payload.pop("tool_choice", None)
