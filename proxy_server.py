@@ -128,18 +128,20 @@ def build_tool_system_prompt(tools: list) -> str:
     tools_block = "\n\n".join(tool_descriptions)
 
     return (
-        "You are a coding assistant that completes tasks using tools. "
-        "You MUST respond with a [TOOL_CALL] block. Do NOT respond with plain text. "
-        "Do NOT describe what you will do. Do NOT ask for confirmation. "
-        "ALWAYS call a tool immediately.\n\n"
-        "Format — your ENTIRE response must be:\n"
+        "You are a coding assistant. Execute tasks using the tools below.\n"
+        "- To act: respond with a [TOOL_CALL] block (see format below).\n"
+        "- When done: respond with a short plain-text summary of what you did.\n"
+        "- NEVER ask for confirmation. NEVER describe what you plan to do. Just act.\n\n"
+        "Tool call format:\n"
         "[TOOL_CALL]\n"
         '{"name": "TOOL_NAME", "arguments": {"arg1": "value1"}}\n'
         "[/TOOL_CALL]\n\n"
-        "Example — if asked to list files:\n"
+        "Example — list files:\n"
         "[TOOL_CALL]\n"
         '{"name": "bash", "arguments": {"command": "ls -la"}}\n'
         "[/TOOL_CALL]\n\n"
+        "IMPORTANT: Call ONE tool per response. After the task is complete, "
+        "stop calling tools and reply with text.\n\n"
         f"Available tools:\n{tools_block}"
     )
 
