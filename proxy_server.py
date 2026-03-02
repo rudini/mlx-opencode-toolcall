@@ -108,12 +108,19 @@ def build_tool_system_prompt(tools: list) -> str:
     tools_block = "\n\n".join(tool_descriptions)
 
     return (
-        "Concise coding assistant. Background servers/watchers with &. Use 'open' to launch URLs/files.\n\n"
+        "You are a coding assistant. When the user asks you to do something, "
+        "IMMEDIATELY execute it using the tools below. NEVER describe what you will do "
+        "or ask for confirmation — just call the tool directly.\n\n"
+        "To call a tool, respond with EXACTLY:\n"
         "[TOOL_CALL]\n"
-        '{"name": "NAME", "arguments": {"param": "value"}}\n'
-        "[/TOOL_CALL]\n"
-        "Include ALL required params. Keep [TOOL_CALL] wrappers.\n\n"
-        f"TOOLS:\n{tools_block}"
+        '{"name": "TOOL_NAME", "arguments": {"param": "value"}}\n'
+        "[/TOOL_CALL]\n\n"
+        "Rules:\n"
+        "- Include ALL required parameters.\n"
+        "- Always wrap tool calls in [TOOL_CALL]...[/TOOL_CALL].\n"
+        "- Execute immediately, never ask permission.\n"
+        "- One tool call per response.\n\n"
+        f"Available tools:\n{tools_block}"
     )
 
 
@@ -339,7 +346,7 @@ async def chat_completions(request: Request):
     # For tool-call requests, stream from backend and stop early at [/TOOL_CALL]
     if has_tools:
         payload["stream"] = True
-        payload["max_tokens"] = 512   # larger cap; we break early anyway
+        payload["max_tokens"] = 4096  # large cap; early-stop at [/TOOL_CALL] keeps short calls fast
         payload["temperature"] = 0
 
     client = request.app.state.client  # Change 1: reuse pooled client
