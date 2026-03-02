@@ -195,6 +195,15 @@ class TestParseToolCalls:
         assert args["filePath"] == "/a/b.js"
         assert "return 2" in args["newString"]
 
+    def test_missing_closing_brace(self):
+        # Model sometimes forgets the outer closing brace
+        text = '[TOOL_CALL]\n{"name": "bash", "arguments": {"command": "ls -la"}\n[/TOOL_CALL]'
+        remaining, tc = parse_tool_calls(text)
+        assert tc is not None, "Should recover from missing closing brace"
+        assert tc[0]["function"]["name"] == "bash"
+        args = json.loads(tc[0]["function"]["arguments"])
+        assert args["command"] == "ls -la"
+
     def test_mixed_valid_and_invalid(self):
         text = (
             '[TOOL_CALL]\n{"name": "bash", "arguments": {"command": "ls"}}\n[/TOOL_CALL]\n'

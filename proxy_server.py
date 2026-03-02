@@ -108,20 +108,61 @@ def build_tool_system_prompt(tools: list) -> str:
     tools_block = "\n\n".join(tool_descriptions)
 
     return (
-        "You are a coding assistant. When the user asks you to do something, "
-        "IMMEDIATELY execute it using the tools below. NEVER describe what you will do "
-        "or ask for confirmation — just call the tool directly.\n\n"
-        "To call a tool, respond with EXACTLY:\n"
+        "You are a coding assistant that completes tasks using tools. "
+        "You MUST respond with a [TOOL_CALL] block. Do NOT respond with plain text. "
+        "Do NOT describe what you will do. Do NOT ask for confirmation. "
+        "ALWAYS call a tool immediately.\n\n"
+        "Format — your ENTIRE response must be:\n"
         "[TOOL_CALL]\n"
-        '{"name": "TOOL_NAME", "arguments": {"param": "value"}}\n'
+        '{"name": "TOOL_NAME", "arguments": {"arg1": "value1"}}\n'
         "[/TOOL_CALL]\n\n"
-        "Rules:\n"
-        "- Include ALL required parameters.\n"
-        "- Always wrap tool calls in [TOOL_CALL]...[/TOOL_CALL].\n"
-        "- Execute immediately, never ask permission.\n"
-        "- One tool call per response.\n\n"
+        "Example — if asked to list files:\n"
+        "[TOOL_CALL]\n"
+        '{"name": "bash", "arguments": {"command": "ls -la"}}\n'
+        "[/TOOL_CALL]\n\n"
         f"Available tools:\n{tools_block}"
     )
+
+
+def _try_parse_json(raw: str):
+    """Try increasingly aggressive repairs to parse model-emitted JSON.
+
+    Strategies (in order):
+      1. Direct parse
+      2. Fix literal newlines inside string values
+      3. Fix missing closing braces
+      4. Both fixes combined
+    Returns parsed dict or None.
+    """
+    def _try(s):
+        try:
+            return orjson.loads(s)
+        except (orjson.JSONDecodeError, ValueError):
+            return None
+
+    # 1. Direct
+    result = _try(raw)
+    if result is not None:
+        return result
+
+    # 2. Fix literal newlines
+    fixed_nl = _fix_json_newlines(raw)
+    result = _try(fixed_nl)
+    if result is not None:
+        return result
+
+    # 3. Fix missing closing braces
+    def _fix_braces(s):
+        deficit = s.count('{') - s.count('}')
+        return s + '}' * deficit if deficit > 0 else s
+
+    result = _try(_fix_braces(raw))
+    if result is not None:
+        return result
+
+    # 4. Both fixes
+    result = _try(_fix_braces(fixed_nl))
+    return result
 
 
 def parse_tool_calls(text: str) -> tuple[str | None, list | None]:
@@ -137,13 +178,9 @@ def parse_tool_calls(text: str) -> tuple[str | None, list | None]:
     tool_calls = []
     for idx, match in enumerate(matches):
         raw = match.strip()
-        try:
-            parsed = orjson.loads(raw)
-        except (orjson.JSONDecodeError, ValueError):
-            try:
-                parsed = orjson.loads(_fix_json_newlines(raw))
-            except (orjson.JSONDecodeError, ValueError):
-                continue
+        parsed = _try_parse_json(raw)
+        if parsed is None:
+            continue
         name = parsed.get("name", "unknown")
         arguments = parsed.get("arguments", {})
         tool_calls.append({
