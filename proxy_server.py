@@ -395,7 +395,7 @@ def rewrite_response(data: dict, tool_names: list, tool_schemas: dict = None) ->
                 choice["message"] = msg
                 choice["finish_reason"] = "tool_calls"
             else:
-                print(f"[proxy] WARNING: No tool_call found in model output")
+                print(f"[proxy] No tool_call in response (plain text reply)")
     except Exception as e:
         print(f"[proxy] Response rewrite error: {e}")
 
